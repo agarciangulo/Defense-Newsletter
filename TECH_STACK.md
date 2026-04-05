@@ -2,6 +2,8 @@
 
 This document catalogs all technologies, libraries, and services required for the Client Intelligence Digest Agent. It complements `ARCHITECTURE.md` by specifying the exact tools behind each component.
 
+The system uses a **dual-path source model**: client-specific sources (scraped via HTML) and general industry sources (scraped via RSS/HTML). Both paths converge before LLM summarization. The tech stack serves both paths with the same set of libraries.
+
 ---
 
 ## 1. Architecture → Tech Mapping

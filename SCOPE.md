@@ -2,9 +2,14 @@
 
 ## Objective
 
-Build an automated agent that monitors a fixed set of public sources (publications, newsletters, websites) on a weekly basis, identifies any mentions of tracked clients and their projects via keyword matching, and delivers a curated email newsletter featuring:
+Build an automated agent that monitors two types of public sources weekly:
 
-1. **Relevant Highlights** — The most important and noteworthy mentions across all clients, with context and analysis
+1. **Client-specific sources** — Each tracked client's own media pages (press releases, news mentions, featured stories)
+2. **General industry sources** — Broad publications (e.g., Defense News) that may mention any tracked client
+
+The agent identifies relevant content, analyzes it with an LLM, and delivers a curated email newsletter featuring:
+
+1. **Relevant Highlights** — The most important and noteworthy developments across all clients, with context and analysis
 2. **Per-Client Sections** — Organized by client, then by project, with summaries of all mentions and direct links to original sources
 
 The agent runs weekly via GitHub Actions with zero manual intervention.
@@ -14,20 +19,22 @@ The agent runs weekly via GitHub Actions with zero manual intervention.
 ## Core Pipeline
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌───────────────────┐     ┌──────────────────┐     ┌──────────────┐     ┌──────────────┐
-│  SCHEDULER   │────▶│  SOURCE SCRAPER   │────▶│  KEYWORD MATCHER   │────▶│  LLM SUMMARIZER   │────▶│  EMAIL        │────▶│  STATE        │
-│  (GH Actions │     │  (RSS + HTML)     │     │  (client registry) │     │  + HIGHLIGHT       │     │  COMPOSER &   │     │  UPDATE       │
-│   weekly)    │     │  fixed source list│     │  keyword-based     │     │  SELECTOR          │     │  SENDER       │     │  (JSON file)  │
-└─────────────┘     └──────────────────┘     └───────────────────┘     └──────────────────┘     └──────────────┘     └──────────────┘
+┌─────────────┐     ┌───────────────────────────────────────────┐     ┌──────────────────┐     ┌──────────────┐     ┌──────────────┐
+│  SCHEDULER   │     │            SOURCE SCRAPING                 │     │  LLM SUMMARIZER   │     │  EMAIL        │     │  STATE        │
+│  (GH Actions │────▶│                                            │────▶│  + HIGHLIGHT       │────▶│  COMPOSER &   │────▶│  UPDATE       │
+│   weekly)    │     │  Client Path           General Path        │     │  SELECTOR          │     │  SENDER       │     │  (JSON file)  │
+│              │     │  (auto-tagged)    (keyword/LLM matched)   │     │  (Claude)          │     │               │     │               │
+└─────────────┘     └───────────────────────────────────────────┘     └──────────────────┘     └──────────────┘     └──────────────┘
 ```
 
 ### Stage Descriptions
 
 | Stage | Input | Output | LLM? |
 |-------|-------|--------|------|
-| **Source Scraper** | Fixed source list (RSS feeds + HTML pages) | Articles with title, URL, body text, publish date, source name | No |
-| **Keyword Matcher** | All scraped articles + Client registry | Matched articles grouped by client → project, with matched keywords | No |
-| **LLM Summarizer** | Matched articles per client | Per-client/project narrative summaries | Yes |
+| **Client-Specific Scraper** | Client's own media pages (HTML) | Articles auto-tagged to that client | No |
+| **General Source Scraper** | Industry publications (RSS/HTML) | Untagged articles from the wider industry | No |
+| **Keyword/LLM Matcher** | General-source articles + Client registry | Articles matched and tagged to clients | Optional |
+| **LLM Summarizer** | All tagged articles (from both paths) per client | Per-client/project narrative summaries | Yes |
 | **Highlight Selector** | All client summaries | Top highlights across all clients with brief analysis | Yes |
 | **Email Composer** | Highlights + per-client summaries + metadata | Formatted HTML email with source links | No |
 | **Email Sender** | Composed email + subscriber list | Delivered newsletter | No |
@@ -35,11 +42,51 @@ The agent runs weekly via GitHub Actions with zero manual intervention.
 
 ---
 
+## Dual-Path Source Model
+
+### Why Two Paths?
+
+Not all sources are the same. Some sources *belong to* a specific client (their own media pages), while others are general industry publications that may mention any client. These require fundamentally different handling:
+
+```
+    CLIENT-SPECIFIC SOURCES                     GENERAL SOURCES
+  (client's own media pages)              (industry publications)
+           │                                        │
+           ▼                                        ▼
+    Scrape & auto-tag                      Scrape all articles
+    to known client                                 │
+           │                                        ▼
+           │                              Keyword / LLM match
+           │                              against client registry
+           │                                        │
+           └──────────────┬─────────────────────────┘
+                          │
+                          ▼
+                Tagged articles (merged)
+                from both paths
+                          │
+                          ▼
+               LLM Summarizer + Highlights
+                          │
+                          ▼
+                     Email Digest
+```
+
+| Aspect | Client-Specific Path | General Source Path |
+|--------|---------------------|--------------------|
+| **Example** | Draper's news releases, "In the News" page | Defense News RSS feed |
+| **Client known?** | Yes — by definition | No — needs matching |
+| **Matching needed?** | No — auto-tagged to client | Yes — keyword and/or LLM |
+| **Typical format** | HTML (each client's website) | RSS (industry pubs tend to have feeds) |
+| **What the LLM does** | Categorize by project, assess significance | (Optionally) catch semantic mentions missed by keywords |
+
+---
+
 ## Client Registry
 
 ### Purpose
 
-The client registry defines *what the agent is looking for*. Every matched article traces back to a client and project in this registry. Without it, the keyword matcher has nothing to match against.
+The client registry defines *who we're tracking* and *where to look*. Each client includes their own media pages (client-specific sources) plus project definitions that drive both the keyword matcher and the LLM summarizer.
 
 ### Registry Structure
 
@@ -47,110 +94,109 @@ The client registry defines *what the agent is looking for*. Every matched artic
 {
   "clients": [
     {
-      "client_name": "Acme Defense Systems",
-      "aliases": ["Acme Defense", "Acme DS", "ADS"],
+      "client_name": "Draper",
+      "aliases": ["Draper Laboratory", "Charles Stark Draper Laboratory", "Draper Lab"],
       "industry": "Defense & Aerospace",
-      "projects": [
+      "client_sources": [
         {
-          "project_name": "Project Falcon",
-          "keywords": ["Project Falcon", "Falcon UAV", "Falcon drone program"],
-          "description": "Next-generation autonomous UAV platform"
+          "name": "News Releases",
+          "url": "https://www.draper.com/media-center/news-releases",
+          "type": "html",
+          "selectors": { }
         },
         {
-          "project_name": "Shield Network",
-          "keywords": ["Shield Network", "ShieldNet", "Acme cybersecurity platform"],
-          "description": "Enterprise cybersecurity monitoring system"
+          "name": "In the News",
+          "url": "https://www.draper.com/media-center/in-the-news",
+          "type": "html",
+          "selectors": { }
+        },
+        {
+          "name": "Featured Stories",
+          "url": "https://www.draper.com/media-center/featured-stories",
+          "type": "html",
+          "selectors": { }
         }
-      ]
-    },
-    {
-      "client_name": "Northgate Industries",
-      "aliases": ["Northgate", "NGI"],
-      "industry": "Defense Contracting",
+      ],
       "projects": [
         {
-          "project_name": "Titan Upgrade Program",
-          "keywords": ["Titan Upgrade", "Titan modernization", "Titan program"],
-          "description": "Vehicle fleet modernization contract"
+          "project_name": "Navy Strategic Systems",
+          "keywords": ["Navy Strategic", "submarine guidance", "inertial sensor"],
+          "description": "Guidance and navigation systems for Navy submarine-launched ballistic missiles"
+        },
+        {
+          "project_name": "Microelectronics",
+          "keywords": ["microelectronics", "chip design", "NEMC", "Northeast Microelectronics Coalition"],
+          "description": "Chip design, advanced packaging, and microelectronics initiatives"
+        },
+        {
+          "project_name": "Space Systems",
+          "keywords": ["space navigation", "VLEO", "lunar", "ISAM", "spacecraft navigation"],
+          "description": "Space navigation, in-space servicing, and exploration systems"
         }
       ]
     }
-  ]
-}
-```
-
-### Matching Behavior
-
-- **Client-level match**: Article mentions the client name or any alias
-- **Project-level match**: Article mentions any project keyword
-- Both are case-insensitive
-- A single article can match multiple clients or multiple projects within the same client
-- Client-level matches (name/alias but no specific project keyword) are grouped under a "General" category for that client
-
----
-
-## Source Configuration
-
-### Purpose
-
-The source list defines *where the agent looks*. Each source is a publicly accessible URL that the agent scrapes on a fixed schedule.
-
-### Source Structure
-
-```json
-{
-  "sources": [
+  ],
+  "general_sources": [
     {
       "name": "Defense News",
       "url": "https://www.defensenews.com/rss/",
       "type": "rss",
       "active": true
-    },
-    {
-      "name": "Industry Weekly Blog",
-      "url": "https://www.example.com/news",
-      "type": "html",
-      "selectors": {
-        "article_list": "div.article-card",
-        "title": "h2.title a",
-        "link": "h2.title a@href",
-        "date": "span.date",
-        "body": "div.article-body"
-      },
-      "active": true
     }
   ]
 }
 ```
 
+### Matching Behavior (General Sources Only)
+
+- **Client-level match**: Article mentions the client name or any alias
+- **Project-level match**: Article mentions any project keyword
+- Both are case-insensitive with word-boundary matching
+- A single article can match multiple clients or multiple projects
+- Client-level matches (name/alias but no specific project keyword) are grouped under a "General" category
+
+### Client-Specific Source Behavior
+
+- All articles scraped from a client's own pages are auto-tagged to that client
+- The LLM categorizes them by project during the summarization stage
+- No keyword matching is needed — the client association is inherent
+
+---
+
+## General Source Configuration
+
+### Purpose
+
+General sources are industry-wide publications that may mention any tracked client. These are scraped broadly, then matched against the client registry.
+
 ### Source Types
 
 | Type | Library | How It Works | Best For |
 |------|---------|--------------|----------|
-| **RSS** | `feedparser` | Parses structured RSS/Atom feed; articles come with title, link, summary, date | Publications with RSS feeds (most news sites) |
-| **HTML** | `requests` + `BeautifulSoup` | Fetches the page, extracts articles using CSS selectors defined per source | Sites without RSS feeds; blogs, press release pages |
+| **RSS** | `feedparser` | Parses structured RSS/Atom feed; articles come with title, link, summary, date | Publications with RSS feeds (most news sites like Defense News) |
+| **HTML** | `requests` + `BeautifulSoup` | Fetches the page, extracts articles using CSS selectors defined per source | Sites without RSS feeds |
 
-Both types produce the same output: a list of `Article` objects with normalized fields. Everything downstream is source-type-agnostic.
+Both types produce the same `Article` output. Everything downstream is source-type-agnostic.
 
 ---
 
-## Matching Approach
+## Matching Approach (General Sources)
 
 ### MVP: Keyword Matching
 
-The Keyword Matcher is a deterministic, non-LLM stage. It scans each article's title and body text for keywords from the client registry.
+The Keyword Matcher runs only on articles from general sources. It scans each article's title and body text for keywords from the client registry.
 
 | Matching Rule | Description |
 |---------------|-------------|
-| **Case-insensitive** | "Project Falcon" matches "project falcon" and "PROJECT FALCON" |
-| **Whole-word by default** | "Titan" should not match "Titanium" — use word boundary matching |
+| **Case-insensitive** | "Draper" matches "draper" and "DRAPER" |
+| **Whole-word by default** | "Draper" should not match "Draperidge" — use word boundary matching |
 | **Multi-match allowed** | One article can match multiple clients/projects |
 | **Client-level fallback** | If an article matches a client name but no specific project, it's filed under "General" |
-| **Match context** | Store the sentence(s) where the keyword was found — useful for the LLM summarizer |
+| **Match context** | Store the sentence(s) where the keyword was found |
 
-### Future Enhancement: Semantic Matching
+### Future Enhancement: LLM-Assisted Matching
 
-A future upgrade could add LLM-powered semantic matching to catch indirect references (e.g., "the aerospace giant's latest drone program" → Acme Defense / Project Falcon). This is out of scope for MVP but the architecture supports it — the Keyword Matcher stage can be swapped or augmented without affecting downstream stages.
+A future upgrade could add LLM-powered semantic matching on general sources to catch indirect references (e.g., "the Cambridge-based defense lab" → Draper). This is out of scope for MVP but the architecture supports it — the Matcher stage can be augmented without affecting other stages.
 
 ---
 
@@ -172,18 +218,19 @@ Each highlight includes:
 
 ### Per-Client Sections
 
-For each client with matches that week:
+For each client with content that week:
 
-- **Client header** with the client name and total number of mentions
+- **Client header** with the client name and total number of articles
 - **Per-project subsections** with:
   - Project name
   - Summary of what was found (LLM-generated, 100–200 words per project)
   - List of source articles with titles and links
-- **General mentions** (client-level matches that don't map to a specific project)
+  - Source origin noted (client media page vs. industry publication)
+- **General mentions** (articles that don't map to a specific project)
 
 ### Quiet Week Handling
 
-If no matches are found in a given week, send a brief "quiet week" notice confirming the system ran successfully. This distinguishes "nothing found" from "the system broke."
+If no content is found in a given week, send a brief "quiet week" notice confirming the system ran successfully.
 
 ---
 
@@ -194,7 +241,7 @@ If no matches are found in a given week, send a brief "quiet week" notice confir
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📊 Client Intelligence Digest — Week of {Date Range}
-   {N} sources scanned · {M} articles matched · {C} clients mentioned
+   {N} sources scanned · {M} articles found · {C} clients covered
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 🔔 THIS WEEK'S HIGHLIGHTS
@@ -213,34 +260,36 @@ If no matches are found in a given week, send a brief "quiet week" notice confir
 
 📋 CLIENT DETAILS
 
-┌─ ACME DEFENSE SYSTEMS (4 mentions)
+┌─ DRAPER (6 articles)
 │
-│  📁 Project Falcon (2 mentions)
+│  📁 Navy Strategic Systems (2 articles)
 │     {100-200 word summary}
-│     • Source Article Title — 🔗 Link
-│     • Source Article Title — 🔗 Link
+│     • Article Title — Source Name 🔗
+│     • Article Title — Source Name 🔗
 │
-│  📁 Shield Network (1 mention)
+│  📁 Microelectronics (1 article)
 │     {100-200 word summary}
-│     • Source Article Title — 🔗 Link
+│     • Article Title — Source Name 🔗
 │
-│  📁 General (1 mention)
+│  📁 General (3 articles)
 │     {Brief summary}
-│     • Source Article Title — 🔗 Link
+│     • Article Title — Source Name 🔗
+│     • Article Title — Source Name 🔗
+│     • Article Title — Source Name 🔗
 │
 └─────────────────────────────────
 
-┌─ NORTHGATE INDUSTRIES (2 mentions)
+┌─ {NEXT CLIENT} ({N} articles)
 │  ...
 └─────────────────────────────────
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📊 This Week's Stats
-   Sources scanned: {N}
-   Articles processed: {A}
-   Articles matched: {M}
-   Clients mentioned: {C}
+   Client sources scraped: {N}
+   General sources scraped: {N}
+   Total articles processed: {A}
+   Clients covered: {C}
    Date range: {start} – {end}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -283,7 +332,7 @@ If no matches are found in a given week, send a brief "quiet week" notice confir
 
 ### Purpose
 
-Unlike the ArXiv digest (which is fully stateless), this system needs to track which articles have already been processed to avoid re-surfacing the same content week after week.
+The system tracks which articles have already been processed to avoid re-surfacing the same content week after week.
 
 ### Approach
 
@@ -291,15 +340,16 @@ A lightweight JSON file committed to the repository after each run.
 
 ```json
 {
-  "last_run": "2026-04-01T11:00:00Z",
+  "last_run": "2026-04-01T12:00:00Z",
   "processed_articles": [
     {
-      "url": "https://www.defensenews.com/article/12345",
+      "url": "https://www.draper.com/news/article-123",
       "url_hash": "a1b2c3d4",
-      "title": "Acme Defense Wins $500M Contract",
-      "source": "Defense News",
+      "title": "Draper Wins Navy Contract",
+      "source": "Draper — News Releases",
+      "source_path": "client",
       "processed_date": "2026-04-01",
-      "matched_clients": ["Acme Defense Systems"]
+      "client": "Draper"
     }
   ]
 }
@@ -316,7 +366,7 @@ A lightweight JSON file committed to the repository after each run.
 
 ### Retention
 
-Keep the last 90 days of processed articles in state. Older entries are pruned on each run to prevent the file from growing indefinitely.
+Keep the last 90 days of processed articles in state. Older entries are pruned on each run.
 
 ---
 
@@ -324,10 +374,11 @@ Keep the last 90 days of processed articles in state. Older entries are pruned o
 
 | Category | Criteria |
 |----------|----------|
-| **Source Scraping** | All configured sources are fetched reliably; both RSS and HTML types work |
-| **Matching Quality** | Client/project mentions are accurately identified with low false positives |
-| **Summary Quality** | Per-client summaries are accurate, concise, and capture the key information |
-| **Highlight Quality** | Highlights reflect genuinely important developments, not routine mentions |
+| **Source Scraping** | All configured sources (client-specific and general) are fetched reliably |
+| **Client Coverage** | Client-specific source articles are correctly auto-tagged |
+| **Matching Quality** | Keyword matcher on general sources accurately identifies client mentions |
+| **Summary Quality** | Per-client summaries are accurate, concise, and capture key information |
+| **Highlight Quality** | Highlights reflect genuinely important developments |
 | **Email Delivery** | Newsletter arrives weekly at a consistent time; formatting renders correctly |
 | **State Management** | No duplicate articles across consecutive weeks; state file stays healthy |
 | **Reliability** | Agent runs unattended via GitHub Actions without failures for 4+ consecutive weeks |
@@ -340,13 +391,14 @@ Keep the last 90 days of processed articles in state. Older entries are pruned o
 
 | Constraint | Details |
 |------------|---------|
-| **Data sources** | Fixed list of public URLs (RSS feeds and HTML pages); no paywalled content |
-| **Source access** | All sources are publicly accessible; rate-limit-friendly fetching (~3s between requests) |
-| **Matching** | Keyword-based for MVP; semantic matching deferred |
+| **Client sources** | HTML pages on client websites; no login or paywall required |
+| **General sources** | Public RSS feeds and HTML pages; no paywalled content |
+| **Source access** | Rate-limit-friendly fetching (~3s between requests) |
+| **Matching** | Keyword-based for MVP on general sources; LLM-assisted matching deferred |
 | **LLM provider** | Anthropic (Claude) for summarization and highlight selection |
 | **Email delivery** | Gmail SMTP with App Password |
 | **Scheduling** | GitHub Actions cron (weekly) |
-| **Subscribers** | Shared newsletter across all subscribers (per-subscriber filtering is future) |
+| **Subscribers** | Shared newsletter across all subscribers |
 | **Language** | English-language sources only |
 | **State storage** | JSON file committed to repository; no external database |
 
@@ -354,17 +406,18 @@ Keep the last 90 days of processed articles in state. Older entries are pruned o
 
 ## Out of Scope (Deferred)
 
-- Semantic / LLM-powered matching (beyond keyword matching)
+- LLM-powered semantic matching on general sources
 - Per-subscriber client filtering
 - Web UI or dashboard
 - Paywalled source access
+- JavaScript-rendered page scraping (would need Playwright)
 - Slack/Teams integration
 - Sentiment analysis on mentions
 - Historical trend tracking or charts
-- Competitor monitoring (clients' competitors)
+- Competitor monitoring
 - Automatic source discovery
 - Non-English source support
-- Real-time alerts (immediate notification on high-priority mentions)
+- Real-time alerts
 
 ---
 
@@ -372,7 +425,7 @@ Keep the last 90 days of processed articles in state. Older entries are pruned o
 
 ### Scheduling & Timing
 
-**Newsletter schedule:** Run every Monday at **7:00 AM ET**, covering the previous 7 days of publications.
+**Newsletter schedule:** Run every Monday at **7:00 AM ET**, covering the previous 7 days.
 
 | Period Covered | Newsletter Runs |
 |----------------|-----------------|
@@ -381,35 +434,27 @@ Keep the last 90 days of processed articles in state. Older entries are pruned o
 
 **GitHub Actions cron (UTC):** `0 12 * * 1` (12:00 UTC = 7:00 AM ET, every Monday)
 
-### Why Monday Morning
+### Dual-Path Architecture
 
-The account manager starts the week with a full picture of what happened with clients over the past week. This gives them context before any Monday meetings or calls.
+Client-specific sources and general sources serve fundamentally different purposes:
+- Client sources tell us "what is this client publishing about themselves?"
+- General sources tell us "what is the industry saying about this client?"
 
-### Keyword Matching Over LLM Matching (MVP)
+Keeping them as two distinct paths with a merge point is cleaner than trying to force them into one unified scraping model. The merge happens naturally when all articles are tagged to clients and ready for summarization.
 
-Keyword matching is fast, deterministic, free (no LLM cost), and easy to debug. For a known set of clients and projects with specific names, keyword matching captures the vast majority of relevant mentions. Semantic matching can be layered on later without changing the pipeline structure.
+### Keyword Matching on General Sources Only
+
+Client-specific source articles don't need matching — they're auto-tagged by definition. Keyword matching only runs on general source articles, keeping the matcher focused and efficient.
 
 ### State File in Repository
 
-Storing state as a JSON file committed to the repo is the simplest approach with zero infrastructure. The tradeoff is that the GitHub Actions workflow needs write access to push commits. This is acceptable for a single-user automation tool and avoids external databases or cloud storage.
-
-### Separate RSS and HTML Adapters
-
-Rather than building one scraper that handles everything, the system uses two clean adapters (RSS and HTML) behind a common interface. This keeps each adapter simple and makes it easy to add new source types later (e.g., API-based sources).
-
-### Duplicate Handling
-
-Articles are deduplicated by URL. If the same article appears across multiple sources (e.g., syndicated content), it is processed only once but credits all sources.
+Storing state as a JSON file committed to the repo is the simplest approach with zero infrastructure. The GitHub Actions workflow needs write access to push the state commit.
 
 ### Error Handling
 
-If the pipeline fails at any stage, the system sends an **error notification email** to the subscriber list with:
-- Which stage failed
-- Error message / traceback summary
-- Timestamp
-- Note that the digest will retry on the next scheduled run
-
-If individual sources fail (e.g., a website is temporarily down), the pipeline continues with the remaining sources and notes which sources were unreachable in the email footer.
+- If individual sources fail, the pipeline continues with remaining sources and notes failures in the email footer
+- If the pipeline itself fails, an error notification email is sent
+- If no content is found, a "quiet week" notice is sent
 
 ---
 

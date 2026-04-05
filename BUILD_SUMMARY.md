@@ -6,129 +6,99 @@ A technical summary of the project for reference when writing about the build.
 
 ## What It Does
 
-An automated agent that monitors a fixed set of public sources (RSS feeds, newsletters, websites) every week, identifies mentions of tracked clients and their projects via keyword matching, and delivers a curated email digest every Monday morning — fully automated, zero manual intervention.
+An automated agent that monitors two types of public sources every week:
+
+1. **Client-specific sources** — Each tracked client's own media pages (press releases, news mentions, feature stories). These are auto-tagged to the client.
+2. **General industry sources** — Broad publications like Defense News where any tracked client might be mentioned. These are keyword-matched against a client registry.
+
+Both paths converge into a unified set of client-tagged articles. An LLM then summarizes what each client has been up to (organized by project) and selects the week's top highlights. The result is a curated email newsletter delivered every Monday morning — fully automated, zero manual intervention.
 
 The digest has two tiers:
 
-- **Relevant Highlights (Top Section)**: The 3–5 most significant developments across all clients, each with a brief analytical paragraph explaining why it matters and what the account manager should consider doing about it.
-- **Per-Client Sections**: Organized by client, then by project. Each project section has a 100–200 word narrative summary of what sources reported that week, plus direct links to every original article.
-
-Every mention traces back to a specific source article with a clickable link.
+- **Relevant Highlights (Top Section)**: The 3–5 most significant developments across all clients, each with a brief analytical paragraph explaining strategic implications.
+- **Per-Client Sections**: Organized by client, then by project. Each project section has a 100–200 word narrative summary plus direct links to every source article. Source origin is noted (client media vs. industry publication).
 
 ---
 
 ## The Pipeline
 
-The system is a **linear pipeline** — no databases (beyond a state file), no servers, no queues. Just Python functions called in sequence, triggered by a cron job.
+The system is a **linear pipeline with a dual-path front end** — no databases (beyond a state file), no servers, no queues.
 
 ```
 GitHub Actions (7 AM ET, every Monday)
     │
     ▼
-1. SOURCE SCRAPER — Fetch articles from all configured sources
-    │                 (RSS via feedparser, HTML via requests + BeautifulSoup)
-    │                 Filter to last 7 days, dedup, skip already-processed
-    ▼
-2. KEYWORD MATCHER — Scan articles for client/project mentions
-    │                  (case-insensitive, word-boundary matching)
-    │                  → matched articles grouped by client → project
-    ▼
-3a. PER-CLIENT SUMMARIZER — For each client with matches:
-    │   Send matched articles to Claude → 100-200 word narrative
-    │   summary per project
+1a. CLIENT-SPECIFIC SCRAPER
+    │  For each client: scrape their media pages (HTML)
+    │  Auto-tag all articles to that client
     │
-3b. HIGHLIGHT SELECTOR — Given all client summaries:
-    │   Select 3-5 most significant developments → 2-3 sentence
-    │   analysis per highlight
+1b. GENERAL SOURCE SCRAPER
+    │  Scrape industry publications (RSS + HTML)
+    │  Articles are untagged at this point
     ▼
-4. EMAIL COMPOSER — Render everything into an HTML email
-    │                  via Jinja2 templates
+2.  KEYWORD MATCHER (general sources only)
+    │  Scan general articles for client/project keywords
+    │  Tag matches to clients; discard unmatched
     ▼
-5. EMAIL SENDER — Deliver via Gmail SMTP
+3.  MERGE & DEDUPLICATE
+    │  Combine both paths → group by client
+    ▼
+4a. PER-CLIENT SUMMARIZER — For each client with articles:
+    │  Send all articles to Claude → per-project summaries
+    │  For client-source articles: LLM categorizes by project
+    │  For general-source articles: already keyword-matched
     │
+4b. HIGHLIGHT SELECTOR — Select 3-5 top developments
     ▼
-6. STATE UPDATE — Record processed article URLs → commit state
-                   file back to repository
+5.  EMAIL COMPOSER — Jinja2 HTML template
+    ▼
+6.  EMAIL SENDER — Gmail SMTP
+    ▼
+7.  STATE UPDATE — Record processed URLs → commit to repo
 ```
 
-Total runtime: **~2–5 minutes**. Total weekly cost: **~$0.50–1.50** (almost entirely Anthropic API usage).
+Total runtime: **~2–6 minutes**. Total weekly cost: **~$0.50–1.50**.
 
 ---
 
 ## Key Technical Decisions (and Why)
 
-### Two-Adapter Source Scraper
+### Dual-Path Source Architecture
 
-Sources come in two flavors, and each gets its own clean adapter:
+The most important design decision. Sources fall into two fundamentally different categories:
 
-- **RSS feeds** are parsed via `feedparser`, which handles RSS 2.0, Atom, and RDF formats with automatic date normalization and encoding tolerance.
-- **HTML pages** are scraped via `requests` + `BeautifulSoup`, with per-source CSS selectors defined in the config file (so adding a new HTML source is a config change, not a code change).
+- **Client-specific sources** are each client's own media pages. We already know who the articles belong to — scraping them auto-tags to that client. Example: Draper's News Releases, In the News, and Featured Stories pages.
+- **General industry sources** are publications like Defense News that cover the entire industry. Articles from these need to be matched against the client registry to find relevant mentions.
 
-Both adapters produce identical `Article` objects. Everything downstream is source-type-agnostic.
+Both paths produce the same `Article` objects with the same fields. After tagging, everything downstream is path-agnostic. The merge point combines articles from both paths, deduplicates by URL, and groups by client.
 
-### Keyword Matching Over LLM Matching
+### HTML Scraping with Per-Source Selectors
 
-The Keyword Matcher is a deterministic, non-LLM stage. It uses Python's `re` module with word-boundary matching (`\b...\b`, case-insensitive) to scan article titles and body text against client names, aliases, project names, and keywords.
+Client-specific sources are almost always HTML pages with unique structures. Rather than hard-coding selectors per source, the config file defines CSS selectors for each source. This means adding a new client source is a config change, not a code change. General sources that have RSS feeds use `feedparser` instead.
 
-This was chosen over LLM-based semantic matching because:
-- It's free (no API cost)
-- It's fast (~1-5 seconds for hundreds of articles)
-- It's deterministic (same input → same output)
-- It's debuggable (you can see exactly which keyword triggered a match)
-- For known client and project names, keyword matching catches the vast majority of relevant mentions
+### Keyword Matching Only on General Sources
 
-The tradeoff: it misses indirect references ("the aerospace giant" instead of the client name). Semantic matching can be layered on later without changing the pipeline structure.
+Client-specific source articles don't need matching — they're auto-tagged by definition. The keyword matcher only runs on general-source articles, using Python's `re` module with word-boundary matching. This is fast, free, and deterministic.
 
-### Claude for Summarization, Not for Matching
+### LLM Does Double Duty for Client Sources
 
-The LLM is used where it adds the most value: turning matched articles into concise, useful narratives. The per-client summarizer writes 100–200 word briefings per project. The highlight selector identifies the 3–5 most strategically significant developments and writes brief analyses.
+For general-source articles, keyword matching identifies which project they relate to before they reach the LLM. But client-source articles arrive without project tags. The per-client summarizer handles this: it receives the client's project definitions and categorizes articles into the right projects as part of the summarization call. One LLM call per client handles both categorization and summarization.
 
-The model used is Claude Sonnet — consistent across both LLM stages. The number of LLM calls varies per run based on how many clients have matches (one call per client + one for highlights).
+### Source Origin Tracking
 
-### Client Registry as a First-Class Concept
-
-The matching isn't generic keyword search. It's driven by a structured JSON registry that defines:
-
-- **Clients** with names and aliases (catches "Acme Defense", "Acme DS", "ADS")
-- **Projects** with keywords and descriptions (catches "Project Falcon", "Falcon UAV")
-- **Grouping**: matches are organized by client → project → articles, which drives the email structure
-
-This registry is the single source of truth for "what to look for." Adding a new client or project is a config change.
-
-### State File for Cross-Week Deduplication
-
-Unlike the ArXiv digest (which is fully stateless), this system needs to remember which articles it has already processed. The state is a JSON file (`state/processed.json`) committed to the repository after each run. It stores URL hashes, titles, sources, and matched clients for the last 90 days.
-
-This approach:
-- Requires zero infrastructure (no database)
-- Is git-native (history is tracked automatically)
-- Survives system failures (just re-run; state protects against duplicates)
-- Self-prunes (entries older than 90 days are cleaned up each run)
-
-The tradeoff: the GitHub Actions workflow needs write access to push the state commit. This is a small addition to the workflow configuration.
+Every article carries a `source_path` field ("client" or "general"). This flows through the entire pipeline and appears in the email. Industry publication mentions often carry more weight than self-published client content, so the highlight selector uses this signal when choosing top developments.
 
 ### Shared LLM Client with Retry Logic
 
-All Claude API calls go through a single `call_claude()` function that handles:
+All Claude API calls go through a single `call_claude()` function with exponential backoff and jitter. Identical to the ArXiv digest system's approach.
 
-- Exponential backoff (5s → 10s → 20s → 40s → 60s cap)
-- Random jitter (0–50% of delay) to prevent thundering herd
-- Automatic retry on 429 (rate limit) and 529 (overloaded) errors
-- Up to 5 retry attempts before failing
+### State File for Cross-Week Deduplication
+
+A JSON file (`state/processed.json`) committed to the repository after each run tracks processed article URLs. Entries older than 90 days are pruned automatically.
 
 ### Gmail SMTP — Simplest Thing That Works
 
-Email delivery uses Python's built-in `smtplib` with a Gmail App Password. No SendGrid, no Resend, no AWS SES. For a small subscriber list, this is zero-cost and minimal code. The tradeoff: no analytics, no fancy unsubscribe links, 500 emails/day cap. All acceptable at this scale.
-
-### Graceful Partial Failures
-
-The pipeline is designed to keep going when individual pieces fail:
-
-- One source is down? Skip it, process the rest, note it in the footer.
-- One client's summarization fails? Skip that client, send the digest without it.
-- No matches at all? Send a "quiet week" notice instead of nothing.
-
-Only pipeline-level failures (LLM API completely unreachable, SMTP broken) trigger an abort with an error email.
+Email delivery uses Python's built-in `smtplib` with a Gmail App Password. Zero cost, minimal code.
 
 ---
 
@@ -139,13 +109,13 @@ Only pipeline-level failures (LLM API completely unreachable, SMTP broken) trigg
 | Language | Python 3.12 | Richest scraping/AI ecosystem |
 | LLM | Claude Sonnet | Good summarization quality at reasonable cost |
 | RSS parsing | feedparser | Handles all feed formats, tolerant of malformed XML |
-| HTML scraping | requests + BeautifulSoup | Lightweight, no browser binary needed |
+| HTML scraping | requests + BeautifulSoup | Lightweight, config-driven selectors |
+| Keyword matching | Python `re` (word-boundary) | Fast, free, deterministic |
 | Email | Gmail SMTP (stdlib) | Zero cost, minimal code |
 | Scheduling | GitHub Actions cron | Free, zero infrastructure |
-| Orchestration | Plain Python functions | Pipeline is linear — a framework would add complexity with no benefit |
 | State | JSON file in repo | Zero infrastructure; git-native |
-| Matching | Keyword (regex) | Fast, free, deterministic |
-| Total dependencies | 6 runtime, 3 dev-only | Minimal footprint |
+| Orchestration | Plain Python functions | Pipeline is linear — no framework needed |
+| Config | JSON files | Client registry + sources + subscribers |
 
 ---
 
@@ -153,72 +123,68 @@ Only pipeline-level failures (LLM API completely unreachable, SMTP broken) trigg
 
 | Metric | Value |
 |--------|-------|
-| Sources monitored | Configurable (RSS + HTML mix) |
-| LLM calls per run | Variable (1 per matched client + 1 highlights) |
+| Source types | 2 (client-specific HTML + general RSS/HTML) |
+| LLM calls per run | Variable (1 per client + 1 highlights) |
 | Per-project summary length | 100–200 words |
 | Highlight analysis length | 2–3 sentences each |
-| Pipeline runtime | ~2–5 minutes |
+| Pipeline runtime | ~2–6 minutes |
 | Weekly cost | ~$0.50–1.50 |
 | Monthly cost | ~$2–6 |
-| Lines of Python | ~930 (excluding tests and templates) |
+| Lines of Python | ~990 (excluding tests and templates) |
 | Runtime dependencies | 6 |
 | External services | 3 (GitHub Actions, Anthropic, Gmail) |
-| Infrastructure to maintain | None (state file is self-managing) |
+| Infrastructure to maintain | None |
 
 ---
 
 ## The Build Process
 
-The project is built in 8 phases following a "Build → Verify → Advance" philosophy, with checkpoints after every meaningful piece of work:
+8 phases following "Build → Verify → Advance":
 
-1. **Project setup** — Structure, config files, logging, dev caching utilities
-2. **Source scraper** — RSS adapter, HTML adapter, rate limiting, state filtering
-3. **Keyword matcher** — Word-boundary matching, context extraction, grouping by client/project
-4. **State manager** — Load, update, prune, save, and git-commit state file
-5. **LLM stages** — Per-client summarizer, highlight selector, shared Claude client
-6. **Email system** — Jinja2 templates, SMTP sender, error/quiet week emails
-7. **Pipeline orchestrator** — Wire everything together, DRY_RUN mode, error handling
-8. **GitHub Actions deployment** — Cron workflow, secrets configuration, manual trigger testing
-
-Each phase includes unit tests (mocked, fast, free) and live checkpoint tests (real APIs, manual verification). The dev caching system allows replaying intermediate results during development without re-running expensive stages.
+1. **Project setup** — Structure, config files, logging, dev cache
+2. **Source scraper** — Dual-path: client-specific HTML + general RSS/HTML, rate limiting, state filtering
+3. **Keyword matcher** — Word-boundary matching on general sources only + merge logic
+4. **State manager** — Load, update, prune, save, git commit
+5. **LLM stages** — Per-client summarizer (with project categorization), highlight selector
+6. **Email system** — Jinja2 templates with source origin badges, SMTP sender
+7. **Pipeline orchestrator** — Dual-path wiring, DRY_RUN mode, error handling
+8. **GitHub Actions deployment** — Weekly cron, state commit step, secrets
 
 ---
 
 ## Interesting Design Challenges
 
-### Heterogeneous Source Scraping
+### Two Paths, One Pipeline
 
-Unlike the ArXiv system (one API, one data format), this system scrapes multiple sources with different structures. RSS feeds are well-structured, but HTML pages vary wildly. The solution is per-source CSS selectors in the config file, making the HTML adapter a generic extraction engine driven by configuration rather than hard-coded selectors.
+The dual-path model is the defining architectural feature. The key insight: client-specific sources and general sources are fundamentally different at the scraping stage (auto-tagged vs. needs matching) but produce identical outputs (tagged articles). The merge point is clean — after it, the pipeline doesn't know or care where an article came from.
 
-The tradeoff: each new HTML source requires some upfront work to identify the right selectors. But once configured, it runs hands-off.
+### The "In the News" Hybrid
 
-### Word Boundary Matching
+Some client pages (like Draper's "In the News") are curated lists of third-party articles about the client. These are client-specific sources by configuration, but they link to external content. The scraper handles this by extracting the article metadata (title, date, external URL) from the client's page. If the same article also appears in a general source RSS feed, the deduplication step catches it.
 
-Naive keyword matching ("does the text contain this string?") produces false positives: "Titan" matching "Titanium", "AI" matching "FAIR" or "email". Word-boundary regex (`\bTitan\b`) solves this cleanly. The matcher also handles multi-word phrases and aliases, so "Acme Defense Systems" and "ADS" both trigger a match for the same client.
+### Per-Source CSS Selectors
 
-### State File Growth
+Every HTML source has a different page structure. The config-driven selector approach means each source defines its own CSS selectors (article list container, title, link, date, body). Adding a new client source requires inspecting the HTML and adding selectors — but no code changes.
 
-Left unchecked, the state file would grow indefinitely. The 90-day pruning ensures the file stays manageable (~2-3 KB per week of entries) while retaining enough history to prevent duplicates across any reasonable re-processing window.
+### Project Categorization Without Keyword Matching
 
-### Cross-Client Article Matching
-
-A single article can mention multiple clients or multiple projects for the same client. The matcher handles this by creating separate Match objects for each client/project pair. The grouping logic then presents the article under every client/project it mentions, with appropriate context snippets for each.
+Client-source articles arrive without project tags. Rather than running keyword matching on them (which would be redundant — we already know the client), the LLM categorizer assigns them to projects during the summarization call. This is more accurate than keyword matching because the LLM understands context, and it doesn't add an extra API call.
 
 ---
 
 ## What's Not Built (Yet)
 
-- Semantic / LLM-powered matching (beyond keyword matching)
+- LLM-powered semantic matching on general sources
 - Per-subscriber client filtering
 - Sentiment analysis on mentions
 - Historical trend tracking or dashboards
 - Slack/Teams delivery
 - Real-time alerts for high-priority mentions
 - Competitor monitoring
-- Source health monitoring (detecting when a source goes stale)
-- JavaScript-rendered page support (would need Playwright)
+- JavaScript-rendered page scraping (would need Playwright)
+- Source health monitoring
 
-The architecture is intentionally simple enough that any of these could be added without a rewrite. The pipeline is linear, the components are decoupled, and the configuration is externalized.
+The architecture supports all of these as incremental additions. The dual-path model, in particular, makes it easy to add new source types without affecting the downstream pipeline.
 
 ---
 
@@ -229,16 +195,16 @@ client-intelligence-digest/
 ├── .github/workflows/
 │   └── weekly_digest.yml          # GitHub Actions cron job
 ├── config/
-│   ├── sources.json               # RSS feeds and HTML scraping configs
-│   ├── clients.json               # Client registry with projects/keywords
+│   ├── clients.json               # Client registry + client sources + projects
+│   ├── general_sources.json       # Industry-wide sources
 │   └── subscribers.json           # Email recipient list
 ├── state/
 │   └── processed.json             # Tracked processed articles
 ├── src/
 │   ├── main.py                    # Pipeline orchestrator
-│   ├── scraper.py                 # Source Scraper (RSS + HTML adapters)
-│   ├── matcher.py                 # Keyword Matcher
-│   ├── summarizer.py              # LLM: Per-client summaries
+│   ├── scraper.py                 # Dual-path: client-specific + general scraping
+│   ├── matcher.py                 # Keyword Matcher (general sources only)
+│   ├── summarizer.py              # LLM: Per-client summaries + project categorization
 │   ├── highlights.py              # LLM: Highlight selection
 │   ├── llm.py                     # Shared Claude client with retry logic
 │   ├── email_composer.py          # Jinja2 template rendering
@@ -249,7 +215,7 @@ client-intelligence-digest/
 │   └── dev_cache.py               # Development caching utility
 ├── templates/
 │   ├── digest_email.html          # Main digest email template
-│   └── quiet_week_email.html      # "No matches this week" template
+│   └── quiet_week_email.html      # "No content this week" template
 ├── tests/                         # Unit tests for all modules
 ├── requirements.txt
 └── .env.example
